@@ -127,25 +127,47 @@ def _normalize_catalog_payload(payload) -> dict:
 
 
 def _fetch_catalog_remote() -> dict:
-    try:
-        with httpx.Client(timeout=CATALOG_FETCH_TIMEOUT_SECONDS) as client:
-            response = client.get(CATALOG_ENDPOINT)
-            response.raise_for_status()
-            payload = response.json()
-        catalog = _normalize_catalog_payload(payload)
-        if not catalog:
-            logger.error(
-                "Catalog response from %s parsed to an empty/unrecognized catalog (payload type: %s)",
-                CATALOG_ENDPOINT,
-                type(payload).__name__,
+    last_error = None
+    # A couple of quick retries absorbs transient MetaCatalog Render hiccups,
+    # most commonly a free-tier cold start returning a 502/503 on the first hit.
+    for attempt, delay in enumerate((0, 2, 5)):
+        if delay:
+            time.sleep(delay)
+        try:
+            with httpx.Client(timeout=CATALOG_FETCH_TIMEOUT_SECONDS) as client:
+                response = client.get(CATALOG_ENDPOINT)
+                response.raise_for_status()
+                payload = response.json()
+            catalog = _normalize_catalog_payload(payload)
+            if not catalog:
+                logger.error(
+                    "Catalog response from %s parsed to an empty/unrecognized catalog (payload type: %s)",
+                    CATALOG_ENDPOINT,
+                    type(payload).__name__,
+                )
+            return catalog
+        except httpx.HTTPStatusError as e:
+            last_error = e
+            if e.response.status_code < 500:
+                # Client-side error (4xx) won't fix itself with a retry.
+                break
+            logger.warning(
+                "Catalog fetch attempt %d got %s from %s, %s",
+                attempt + 1, e.response.status_code, CATALOG_ENDPOINT,
+                "retrying" if attempt < 2 else "giving up",
             )
-        return catalog
-    except httpx.HTTPError as e:
-        logger.error("Failed to fetch catalog from %s: %s", CATALOG_ENDPOINT, e)
-        return {}
-    except json.JSONDecodeError as e:
-        logger.error("Catalog response from %s is not valid JSON: %s", CATALOG_ENDPOINT, e)
-        return {}
+        except httpx.HTTPError as e:
+            last_error = e
+            logger.warning(
+                "Catalog fetch attempt %d failed (%s), %s",
+                attempt + 1, e, "retrying" if attempt < 2 else "giving up",
+            )
+        except json.JSONDecodeError as e:
+            logger.error("Catalog response from %s is not valid JSON: %s", CATALOG_ENDPOINT, e)
+            return {}
+
+    logger.error("Failed to fetch catalog from %s after retries: %s", CATALOG_ENDPOINT, last_error)
+    return {}
 
 
 def get_catalog() -> dict:
