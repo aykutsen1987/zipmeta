@@ -97,18 +97,54 @@ _catalog_cache: dict = {}
 _catalog_cache_at: float = 0.0
 
 
+def _normalize_catalog_payload(payload) -> dict:
+    """apps_catalog.json may come back in a few different shapes depending on
+    how MetaCatalog Render serves it. Accept all of them:
+      - a plain list of app objects: [ {app_id: ..., ...}, ... ]
+      - a wrapper object:            { "apps": [ {app_id: ..., ...}, ... ] }
+      - already keyed by app_id:     { "zipmeta": {app_id: ..., ...}, ... }
+    Anything else is treated as malformed.
+    """
+    if isinstance(payload, dict) and "apps" in payload and isinstance(payload["apps"], list):
+        payload = payload["apps"]
+
+    if isinstance(payload, list):
+        result = {}
+        for app in payload:
+            if isinstance(app, dict) and "app_id" in app:
+                result[app["app_id"]] = app
+        return result
+
+    if isinstance(payload, dict):
+        # Could already be {app_id: {...}} — verify entries look like app objects.
+        result = {}
+        for key, app in payload.items():
+            if isinstance(app, dict):
+                result[app.get("app_id", key)] = app
+        return result
+
+    return {}
+
+
 def _fetch_catalog_remote() -> dict:
     try:
         with httpx.Client(timeout=CATALOG_FETCH_TIMEOUT_SECONDS) as client:
             response = client.get(CATALOG_ENDPOINT)
             response.raise_for_status()
-            apps = response.json()
-        return {app["app_id"]: app for app in apps}
+            payload = response.json()
+        catalog = _normalize_catalog_payload(payload)
+        if not catalog:
+            logger.error(
+                "Catalog response from %s parsed to an empty/unrecognized catalog (payload type: %s)",
+                CATALOG_ENDPOINT,
+                type(payload).__name__,
+            )
+        return catalog
     except httpx.HTTPError as e:
         logger.error("Failed to fetch catalog from %s: %s", CATALOG_ENDPOINT, e)
         return {}
-    except (json.JSONDecodeError, KeyError, TypeError) as e:
-        logger.error("Catalog response from %s is malformed: %s", CATALOG_ENDPOINT, e)
+    except json.JSONDecodeError as e:
+        logger.error("Catalog response from %s is not valid JSON: %s", CATALOG_ENDPOINT, e)
         return {}
 
 
