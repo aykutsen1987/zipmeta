@@ -49,7 +49,8 @@ Deploy on Render:
     Build command:  pip install -r requirements.txt
     Start command:  uvicorn main:app --host 0.0.0.0 --port $PORT
     Environment:    GROQ_API_KEY=<your key>
-                    GROQ_MODEL=llama-3.3-70b-versatile   (or any model you prefer)
+                    GROQ_MODEL=openai/gpt-oss-120b   (llama-3.3-70b-versatile was retired by Groq on 2026-08-16)
+                    GROQ_FALLBACK_MODELS=qwen/qwen3.6-27b   (comma-separated, tried in order if primary fails)
                     CATALOG_URL=https://metacatalog-c22c.onrender.com
 """
 
@@ -69,7 +70,14 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("atem-backend")
 
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
-GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
+# NOTE: llama-3.3-70b-versatile was retired by Groq on 2026-08-16.
+# Primary: openai/gpt-oss-120b, fallback: qwen/qwen3.6-27b.
+GROQ_MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
+GROQ_FALLBACK_MODELS = [
+    m.strip()
+    for m in os.environ.get("GROQ_FALLBACK_MODELS", "qwen/qwen3.6-27b").split(",")
+    if m.strip()
+]
 REQUEST_TIMEOUT_SECONDS = float(os.environ.get("GROQ_TIMEOUT_SECONDS", "20"))
 MAX_MESSAGE_LENGTH = 2000
 
@@ -324,18 +332,37 @@ def chat(request: ChatRequest):
 
     system_prompt = build_system_prompt(current_app, catalog)
 
+    models_to_try = [GROQ_MODEL] + [m for m in GROQ_FALLBACK_MODELS if m != GROQ_MODEL]
+
     try:
-        completion = groq_client.chat.completions.create(
-            model=GROQ_MODEL,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_message},
-            ],
-            temperature=0.4,
-            max_tokens=1024,
-            timeout=REQUEST_TIMEOUT_SECONDS,
-            response_format={"type": "json_object"},
-        )
+        completion = None
+        last_status_error = None
+        for model_name in models_to_try:
+            try:
+                completion = groq_client.chat.completions.create(
+                    model=model_name,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_message},
+                    ],
+                    temperature=0.4,
+                    max_tokens=1024,
+                    timeout=REQUEST_TIMEOUT_SECONDS,
+                    response_format={"type": "json_object"},
+                )
+                break
+            except APIStatusError as e:
+                # Model kaldirilmis/gecersizse bir sonraki yedek modeli dene.
+                logger.warning("Groq model '%s' failed (%s), trying next fallback", model_name, e.status_code)
+                last_status_error = e
+                completion = None
+                continue
+
+        if completion is None:
+            if last_status_error is not None:
+                raise last_status_error
+            raise APIConnectionError(request=None)
+
         raw = completion.choices[0].message.content or "{}"
 
         try:
